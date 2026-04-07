@@ -2,3 +2,4 @@ debug*
 token_gen.html
 tokens.json
 .env
+__pycache__
