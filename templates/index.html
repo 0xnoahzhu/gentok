@@ -58,7 +58,10 @@
 
             <!-- Truck Numbers -->
             <div class="mb-3">
-              <label class="form-label">Truck Numbers</label>
+              <label class="form-label">Truck Numbers
+                <a href="#" class="float-end small text-decoration-none"
+                   onclick="clearAllTrucks(); return false;">Clear All</a>
+              </label>
               <div id="truckChips" class="mb-2"></div>
               <div class="input-group">
                 <input type="text" class="form-control" id="truckInput"
@@ -222,6 +225,13 @@ function addTruck() {
 }
 
 function removeTruck(v) { trucks.delete(v); renderChips(); }
+
+function clearAllTrucks() {
+  if (!trucks.size) return;
+  if (!confirm("Remove all truck numbers?")) return;
+  trucks.clear();
+  renderChips();
+}
 
 // Allow Enter key to add truck
 document.addEventListener("DOMContentLoaded", () => {
