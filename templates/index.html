@@ -88,7 +88,7 @@
 
             <!-- Start Time -->
             <div class="mb-3">
-              <label class="form-label">Start Time</label>
+              <label class="form-label">Activate Time</label>
               <input type="time" class="form-control" id="startTime"
                      value="{{ config.get('START_TIME', '') }}">
               <div class="form-text">Leave empty to start immediately.</div>
@@ -230,7 +230,8 @@ async function refreshTokens() {
       tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">No tokens yet.</td></tr>';
       return;
     }
-    tbody.innerHTML = data.map(t => "<tr>" +
+    const items = data.slice(0, 20);
+    tbody.innerHTML = items.map(t => "<tr>" +
       "<td>" + esc(t.timestamp) + "</td>" +
       "<td>" + esc(t.truck_no) + "</td>" +
       "<td>" + esc(t.material) + "</td>" +
