@@ -13,8 +13,11 @@ from etoken_monitor import run_monitor
 from frozen_utils import is_frozen, get_app_data_dir, get_bundled_resource_dir, ensure_browsers_installed
 
 APP_DATA_DIR = get_app_data_dir()
-ENV_FILE = APP_DATA_DIR / ".env"
 TOKENS_FILE = APP_DATA_DIR / "tokens.json"
+ACTIVITY_FILE = APP_DATA_DIR / "activity.json"
+
+# In-memory config — blank on each startup, populated when monitor starts
+_current_config = {}
 
 # In frozen mode, templates are inside sys._MEIPASS; otherwise use default
 _template_folder = str(get_bundled_resource_dir() / "templates") if is_frozen() else "templates"
@@ -29,26 +32,6 @@ if is_frozen():
 # Helpers
 # ---------------------------------------------------------------------------
 
-def read_env() -> dict:
-    """Parse .env into a dict, preserving all keys."""
-    config = {}
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                key, _, value = line.partition("=")
-                config[key.strip()] = value.strip()
-    return config
-
-
-def write_env(config: dict):
-    """Write dict back to .env (overwrites)."""
-    lines = [f"{k}={v}" for k, v in config.items()]
-    ENV_FILE.write_text("\n".join(lines) + "\n")
-
-
 def read_tokens() -> list:
     """Read tokens.json, return list of dicts (newest first)."""
     if not TOKENS_FILE.exists():
@@ -60,34 +43,24 @@ def read_tokens() -> list:
     return list(reversed(tokens))
 
 
+def read_activity() -> list:
+    """Read activity.json, return list of dicts (newest first)."""
+    if not ACTIVITY_FILE.exists():
+        return []
+    try:
+        activities = json.loads(ACTIVITY_FILE.read_text())
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return list(reversed(activities))
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @app.route("/")
 def index():
-    config = read_env()
-    return render_template("index.html", config=config)
-
-
-@app.route("/config", methods=["POST"])
-def save_config():
-    username = request.form.get("username", "").strip()
-    password = request.form.get("password", "").strip()
-    trucks = request.form.get("trucks", "").strip()
-    material = request.form.get("material", "GOODEARTH").strip()
-    cycle_interval = request.form.get("cycle_interval", "30").strip()
-    start_time = request.form.get("start_time", "").strip()
-
-    config = read_env()
-    config["ETOKEN_USERNAME"] = username
-    config["ETOKEN_PASSWORD"] = password
-    config["TRUCK_NO"] = trucks
-    config["MATERIAL"] = material
-    config["CYCLE_INTERVAL"] = cycle_interval
-    config["START_TIME"] = start_time
-    write_env(config)
-    return jsonify({"status": "ok"})
+    return render_template("index.html", config=_current_config)
 
 
 @app.route("/tokens")
@@ -105,6 +78,18 @@ def clear_tokens():
     return jsonify({"status": "ok"})
 
 
+@app.route("/activity")
+def get_activity():
+    return jsonify(read_activity())
+
+
+@app.route("/activity/clear", methods=["POST"])
+def clear_activity():
+    if ACTIVITY_FILE.exists():
+        ACTIVITY_FILE.write_text("[]")
+    return jsonify({"status": "ok"})
+
+
 # ---------------------------------------------------------------------------
 # Monitor control
 # ---------------------------------------------------------------------------
@@ -117,17 +102,34 @@ def _run_monitor_thread():
     """Target function for the monitor background thread."""
     global _stop_event
     _stop_event = threading.Event()
-    # Reload .env values fresh each time the monitor starts
-    from dotenv import load_dotenv
-    load_dotenv(ENV_FILE, override=True)
+    # Set env vars from in-memory config so the monitor picks them up
+    for key, value in _current_config.items():
+        os.environ[key] = value
     asyncio.run(run_monitor(headless=True, stop_event=_stop_event))
 
 
 @app.route("/monitor/start", methods=["POST"])
 def monitor_start():
-    global _monitor_thread
+    global _monitor_thread, _current_config
     if _monitor_thread and _monitor_thread.is_alive():
         return jsonify({"status": "already_running"})
+
+    # Read config from the form submission
+    _current_config = {
+        "ETOKEN_USERNAME": request.form.get("username", "").strip(),
+        "ETOKEN_PASSWORD": request.form.get("password", "").strip(),
+        "TRUCK_NO": request.form.get("trucks", "").strip(),
+        "MATERIAL": request.form.get("material", "GOODEARTH").strip(),
+        "CYCLE_INTERVAL": request.form.get("cycle_interval", "20").strip(),
+        "START_TIME": request.form.get("start_time", "").strip(),
+        "END_TIME": request.form.get("end_time", "").strip(),
+    }
+
+    start_time = _current_config["START_TIME"]
+    end_time = _current_config["END_TIME"]
+    if start_time and end_time and end_time <= start_time:
+        return jsonify({"status": "error", "message": "End Time must be after Start Time."}), 400
+
     _monitor_thread = threading.Thread(target=_run_monitor_thread, daemon=True)
     _monitor_thread.start()
     return jsonify({"status": "started"})

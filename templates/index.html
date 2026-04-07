@@ -15,6 +15,9 @@
     .status-badge { font-size: .85rem; padding: 3px 10px; border-radius: 999px; }
     .status-running { background: #d4edda; color: #155724; }
     .status-stopped { background: #e2e3e5; color: #383d41; }
+    .badge-success { background: #d4edda; color: #155724; }
+    .badge-failed { background: #f8d7da; color: #721c24; }
+    .badge-skipped { background: #e2e3e5; color: #383d41; }
   </style>
 </head>
 <body>
@@ -34,7 +37,7 @@
         <div class="card-header fw-semibold">Configuration</div>
         <div class="card-body">
 
-          <form id="configForm">
+          <div id="configForm">
             <!-- Username -->
             <div class="mb-3">
               <label class="form-label">Login Username</label>
@@ -83,20 +86,23 @@
             <div class="mb-3">
               <label class="form-label">Retry Interval (seconds)</label>
               <input type="number" class="form-control" id="cycleInterval"
-                     value="{{ config.get('CYCLE_INTERVAL', '30') }}" min="5" step="1">
+                     value="{{ config.get('CYCLE_INTERVAL', '20') }}" min="10" step="1">
             </div>
 
-            <!-- Start Time -->
+            <!-- Start / End Time -->
             <div class="mb-3">
               <label class="form-label">Activate Time</label>
-              <input type="time" class="form-control" id="startTime"
-                     value="{{ config.get('START_TIME', '') }}">
-              <div class="form-text">Leave empty to start immediately.</div>
+              <div class="d-flex gap-2 align-items-center">
+                <input type="time" class="form-control" id="startTime"
+                       value="{{ config.get('START_TIME', '') }}" placeholder="Start">
+                <span>to</span>
+                <input type="time" class="form-control" id="endTime"
+                       value="{{ config.get('END_TIME', '') }}" placeholder="End">
+              </div>
+              <div class="form-text">Leave empty to run continuously.</div>
             </div>
 
-            <button type="submit" class="btn btn-primary w-100">Save Configuration</button>
-            <div id="saveMsg" class="mt-2 text-success d-none">Settings saved.</div>
-          </form>
+          </div>
 
         </div>
       </div>
@@ -138,6 +144,37 @@
               </thead>
               <tbody id="tokenBody">
                 <tr><td colspan="6" class="text-center text-muted py-3">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Activity Log ── -->
+      <div class="card mt-4">
+        <div class="card-header d-flex justify-content-between align-items-center fw-semibold">
+          <span>Activity Log</span>
+          <div>
+            <button class="btn btn-sm btn-outline-secondary me-1"
+                    onclick="refreshActivity()">Refresh</button>
+            <button class="btn btn-sm btn-outline-danger"
+                    onclick="clearActivity()">Clear All</button>
+          </div>
+        </div>
+        <div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-hover table-sm mb-0">
+              <thead class="table-light">
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Truck</th>
+                  <th>Material</th>
+                  <th>Status</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody id="activityBody">
+                <tr><td colspan="5" class="text-center text-muted py-3">Loading...</td></tr>
               </tbody>
             </table>
           </div>
@@ -193,33 +230,6 @@ function togglePw() {
   pw.type = pw.type === "password" ? "text" : "password";
 }
 
-// ── Save config ──
-document.addEventListener("DOMContentLoaded", () => {
-  document.getElementById("configForm").addEventListener("submit", async e => {
-    e.preventDefault();
-    const body = new URLSearchParams({
-      username: document.getElementById("username").value,
-      password: document.getElementById("password").value,
-      trucks:   document.getElementById("trucks").value,
-      material: document.getElementById("material").value,
-      cycle_interval: document.getElementById("cycleInterval").value,
-      start_time: document.getElementById("startTime").value,
-    });
-    const res = await fetch("/config", { method: "POST", body });
-    const msg = document.getElementById("saveMsg");
-    if (res.ok) {
-      msg.classList.remove("d-none", "text-danger");
-      msg.classList.add("text-success");
-      msg.textContent = "Settings saved.";
-    } else {
-      msg.classList.remove("d-none", "text-success");
-      msg.classList.add("text-danger");
-      msg.textContent = "Save failed.";
-    }
-    setTimeout(() => msg.classList.add("d-none"), 3000);
-  });
-});
-
 // ── Token table ──
 async function refreshTokens() {
   try {
@@ -249,6 +259,42 @@ async function clearTokens() {
   if (!confirm("Clear all token history?")) return;
   await fetch("/tokens/clear", { method: "POST" });
   refreshTokens();
+}
+
+// ── Activity log table ──
+async function refreshActivity() {
+  try {
+    const res = await fetch("/activity");
+    const data = await res.json();
+    const tbody = document.getElementById("activityBody");
+    if (!data.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">No activity yet.</td></tr>';
+      return;
+    }
+    const items = data.slice(0, 50);
+    tbody.innerHTML = items.map(a => {
+      const statusClass = a.status === "success" ? "badge-success"
+                        : a.status === "failed"  ? "badge-failed"
+                        : "badge-skipped";
+      const details = a.status === "success" ? esc(a.token || a.message) : esc(a.message);
+      return "<tr>" +
+        "<td>" + esc(a.timestamp) + "</td>" +
+        "<td>" + esc(a.truck_no) + "</td>" +
+        "<td>" + esc(a.material) + "</td>" +
+        '<td><span class="status-badge ' + statusClass + '">' + esc(a.status) + '</span></td>' +
+        "<td>" + details + "</td>" +
+        "</tr>";
+    }).join("");
+  } catch {
+    document.getElementById("activityBody").innerHTML =
+      '<tr><td colspan="5" class="text-center text-danger py-3">Error loading activity.</td></tr>';
+  }
+}
+
+async function clearActivity() {
+  if (!confirm("Clear all activity log?")) return;
+  await fetch("/activity/clear", { method: "POST" });
+  refreshActivity();
 }
 
 function esc(s) {
@@ -295,7 +341,20 @@ async function toggleMonitor() {
     if (monitorRunning) {
       await fetch("/monitor/stop", { method: "POST" });
     } else {
-      await fetch("/monitor/start", { method: "POST" });
+      const body = new URLSearchParams({
+        username: document.getElementById("username").value,
+        password: document.getElementById("password").value,
+        trucks:   document.getElementById("trucks").value,
+        material: document.getElementById("material").value,
+        cycle_interval: document.getElementById("cycleInterval").value,
+        start_time: document.getElementById("startTime").value,
+        end_time: document.getElementById("endTime").value,
+      });
+      const res = await fetch("/monitor/start", { method: "POST", body });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(data.message || "Failed to start monitor.");
+      }
     }
     // Brief delay then poll to confirm state
     setTimeout(pollMonitorStatus, 500);
@@ -309,6 +368,8 @@ document.addEventListener("DOMContentLoaded", () => {
   initTrucks();
   refreshTokens();
   setInterval(refreshTokens, 10000);
+  refreshActivity();
+  setInterval(refreshActivity, 10000);
   pollMonitorStatus();
   setInterval(pollMonitorStatus, 5000);
 });

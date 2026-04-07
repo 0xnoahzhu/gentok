@@ -26,8 +26,9 @@ ETOKEN_PASSWORD = os.getenv("ETOKEN_PASSWORD", "")
 TRUCK_PASSWORD = os.getenv("ETOKEN_PASSWORD", "")
 MATERIAL = os.getenv("MATERIAL", "GOODEARTH")
 TRUCK_NO_LIST = [t.strip() for t in os.getenv("TRUCK_NO", "").split(",") if t.strip()]
-CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL", "30"))
+CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL", "20"))
 START_TIME = os.getenv("START_TIME", "")  # e.g. "08:00" — wait until this time before starting cycles
+END_TIME = os.getenv("END_TIME", "")      # e.g. "18:00" — stop when this time is reached
 
 # URLs
 BASE_URL = "https://marinaeaststagingground.com.sg/etoken/index.php/etokenapp"
@@ -40,6 +41,7 @@ DEFAULT_LON = 103.906435
 
 # File paths
 TOKENS_FILE = get_app_data_dir() / "tokens.json"
+ACTIVITY_FILE = get_app_data_dir() / "activity.json"
 
 
 async def safe_query_selector(page, selector, retries=3, delay=0.5):
@@ -85,6 +87,18 @@ def save_token(token_data: dict):
     tokens.append(token_data)
     TOKENS_FILE.write_text(json.dumps(tokens, indent=2))
     print(f"Token saved to {TOKENS_FILE}")
+
+
+def save_activity(activity_data: dict):
+    """Append activity record to activity.json."""
+    activities = []
+    if ACTIVITY_FILE.exists():
+        try:
+            activities = json.loads(ACTIVITY_FILE.read_text())
+        except (json.JSONDecodeError, ValueError):
+            activities = []
+    activities.append(activity_data)
+    ACTIVITY_FILE.write_text(json.dumps(activities, indent=2))
 
 
 async def wait_and_check_login(page, timeout_sec=3):
@@ -295,7 +309,21 @@ async def generate_token_cycle(page, truck_no):
                 print(
                     f"[{datetime.now().strftime('%H:%M:%S')}] Truck already processed, skipping to next."
                 )
+                save_activity({
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "truck_no": truck_no,
+                    "material": MATERIAL,
+                    "status": "skipped",
+                    "message": error_text,
+                })
                 return "already_processed"
+            save_activity({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "truck_no": truck_no,
+                "material": MATERIAL,
+                "status": "failed",
+                "message": error_text,
+            })
             return False
 
     # --- Token generation ---
@@ -393,6 +421,14 @@ async def generate_token_cycle(page, truck_no):
     }
 
     save_token(token_data)
+    save_activity({
+        "timestamp": timestamp,
+        "truck_no": truck_no,
+        "material": MATERIAL,
+        "status": "success",
+        "message": token_data["token"],
+        "token": token_data["token"],
+    })
     return True
 
 
@@ -408,14 +444,15 @@ async def run_monitor(headless=False, stop_event=None):
     if not trucks:
         print("ERROR: No truck numbers configured. Set TRUCK_NO in .env.")
         return
-    cycle_interval = int(os.getenv("CYCLE_INTERVAL", "30"))
+    cycle_interval = int(os.getenv("CYCLE_INTERVAL", "20"))
     start_time = os.getenv("START_TIME", "").strip()
+    end_time = os.getenv("END_TIME", "").strip()
 
     # --- Wait until START_TIME if configured ---
     if start_time:
         try:
-            hour, minute = map(int, start_time.split(":"))
             from datetime import time as dt_time
+            hour, minute = map(int, start_time.split(":"))
             target = dt_time(hour, minute)
             now = datetime.now().time()
             if now < target:
@@ -435,6 +472,20 @@ async def run_monitor(headless=False, stop_event=None):
                     await asyncio.sleep(0.1)
         except (ValueError, TypeError):
             print(f"WARNING: Invalid START_TIME '{start_time}', ignoring.")
+
+    # --- Check if we're already past END_TIME before starting ---
+    if end_time:
+        try:
+            from datetime import time as dt_time
+            hour, minute = map(int, end_time.split(":"))
+            end_dt = dt_time(hour, minute)
+            if datetime.now().time() >= end_dt:
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] Current time is past END_TIME {end_time}. Not starting."
+                )
+                return
+        except (ValueError, TypeError):
+            print(f"WARNING: Invalid END_TIME '{end_time}', ignoring.")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -473,6 +524,21 @@ async def run_monitor(headless=False, stop_event=None):
                 )
 
             cycle += 1
+
+            # --- Check END_TIME: stop if past the configured end time ---
+            if end_time:
+                try:
+                    from datetime import time as dt_time
+                    hour_e, minute_e = map(int, end_time.split(":"))
+                    end_dt = dt_time(hour_e, minute_e)
+                    if datetime.now().time() >= end_dt:
+                        print(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] END_TIME {end_time} reached. Stopping monitor."
+                        )
+                        break
+                except (ValueError, TypeError):
+                    pass
+
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] Next token generation in {cycle_interval} seconds... (Ctrl+C to stop)"
             )
