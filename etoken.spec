@@ -28,12 +28,15 @@ datas = [
     (playwright_path, 'playwright'),
 ]
 
-# Find and bundle Chromium browser
-chromium_dirs = glob.glob(os.path.join(_browsers_path, "chromium-*"))
-if chromium_dirs:
-    chromium_dir = chromium_dirs[0]
-    datas.append((chromium_dir, os.path.join("browsers", os.path.basename(chromium_dir))))
-else:
+# Find and bundle all Playwright Chromium directories
+# (both chromium-* and chromium_headless_shell-* are needed)
+_bundled_any = False
+for _pattern in ("chromium-*", "chromium_headless_shell-*"):
+    for _dir in glob.glob(os.path.join(_browsers_path, _pattern)):
+        datas.append((_dir, os.path.join("browsers", os.path.basename(_dir))))
+        _bundled_any = True
+
+if not _bundled_any:
     print(f"WARNING: No Chromium found in {_browsers_path}. "
           "Run 'playwright install chromium' before building.")
     sys.exit(1)

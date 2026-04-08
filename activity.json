@@ -124,5 +124,12 @@
     "material": "GOODEARTH",
     "status": "failed",
     "message": "No Source Site Entry Record"
+  },
+  {
+    "timestamp": "2026-04-08T21:50:43",
+    "truck_no": "XF68P",
+    "material": "GOODEARTH",
+    "status": "failed",
+    "message": "No Source Site Entry Record"
   }
 ]
