@@ -17,6 +17,24 @@ from playwright.async_api import async_playwright
 
 from frozen_utils import get_app_data_dir
 
+# Locks for safe concurrent file writes (initialized lazily)
+_tokens_lock = None
+_activity_lock = None
+
+
+def _get_tokens_lock():
+    global _tokens_lock
+    if _tokens_lock is None:
+        _tokens_lock = asyncio.Lock()
+    return _tokens_lock
+
+
+def _get_activity_lock():
+    global _activity_lock
+    if _activity_lock is None:
+        _activity_lock = asyncio.Lock()
+    return _activity_lock
+
 # Load environment variables
 env_path = get_app_data_dir() / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -79,29 +97,31 @@ def validate_env():
         sys.exit(1)
 
 
-def save_token(token_data: dict):
+async def save_token(token_data: dict):
     """Append token data to tokens.json."""
-    tokens = []
-    if TOKENS_FILE.exists():
-        try:
-            tokens = json.loads(TOKENS_FILE.read_text())
-        except (json.JSONDecodeError, ValueError):
-            tokens = []
-    tokens.append(token_data)
-    TOKENS_FILE.write_text(json.dumps(tokens, indent=2))
+    async with _get_tokens_lock():
+        tokens = []
+        if TOKENS_FILE.exists():
+            try:
+                tokens = json.loads(TOKENS_FILE.read_text())
+            except (json.JSONDecodeError, ValueError):
+                tokens = []
+        tokens.append(token_data)
+        TOKENS_FILE.write_text(json.dumps(tokens, indent=2))
     print(f"Token saved to {TOKENS_FILE}")
 
 
-def save_activity(activity_data: dict):
+async def save_activity(activity_data: dict):
     """Append activity record to activity.json."""
-    activities = []
-    if ACTIVITY_FILE.exists():
-        try:
-            activities = json.loads(ACTIVITY_FILE.read_text())
-        except (json.JSONDecodeError, ValueError):
-            activities = []
-    activities.append(activity_data)
-    ACTIVITY_FILE.write_text(json.dumps(activities, indent=2))
+    async with _get_activity_lock():
+        activities = []
+        if ACTIVITY_FILE.exists():
+            try:
+                activities = json.loads(ACTIVITY_FILE.read_text())
+            except (json.JSONDecodeError, ValueError):
+                activities = []
+        activities.append(activity_data)
+        ACTIVITY_FILE.write_text(json.dumps(activities, indent=2))
 
 
 async def wait_and_check_login(page, timeout_sec=3):
@@ -312,7 +332,7 @@ async def generate_token_cycle(page, truck_no, material):
                 print(
                     f"[{datetime.now().strftime('%H:%M:%S')}] Truck already processed, skipping to next."
                 )
-                save_activity(
+                await save_activity(
                     {
                         "timestamp": datetime.now().isoformat(timespec="seconds"),
                         "truck_no": truck_no,
@@ -322,7 +342,7 @@ async def generate_token_cycle(page, truck_no, material):
                     }
                 )
                 return "already_processed"
-            save_activity(
+            await save_activity(
                 {
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                     "truck_no": truck_no,
@@ -430,7 +450,7 @@ async def generate_token_cycle(page, truck_no, material):
 
     if not token_value:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: Token generation returned empty token.")
-        save_activity(
+        await save_activity(
             {
                 "timestamp": timestamp,
                 "truck_no": truck_no,
@@ -442,8 +462,8 @@ async def generate_token_cycle(page, truck_no, material):
         )
         return False
 
-    save_token(token_data)
-    save_activity(
+    await save_token(token_data)
+    await save_activity(
         {
             "timestamp": timestamp,
             "truck_no": truck_no,
@@ -533,43 +553,56 @@ async def run_monitor(headless=False, stop_event=None):
             await browser.close()
             return
 
-        # --- Repeated token generation (all trucks per cycle) ---
+        # --- Repeated token generation (all trucks per cycle, in parallel) ---
         cycle = 1
         while not (stop_event and stop_event.is_set()):
             print(f"\n{'=' * 60}")
             print(f"TOKEN GENERATION CYCLE #{cycle}")
             print(f"{'=' * 60}")
 
-            for truck_no in trucks:
-                if stop_event and stop_event.is_set():
-                    break
-
-                print(f"\n--- Cycle #{cycle} | Truck: {truck_no} ---")
+            async def process_truck(truck_no):
+                """Process a single truck on its own page."""
+                truck_page = await context.new_page()
                 try:
-                    result = await generate_token_cycle(page, truck_no, material)
-                    if not result and result != "already_processed":
+                    await truck_page.goto(BASE_URL, wait_until="networkidle")
+
+                    # Re-login if session expired
+                    on_token_page = await safe_query_selector(
+                        truck_page, 'form[name="frmgo"]'
+                    )
+                    if not on_token_page:
                         print(
-                            f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} failed. Continuing to next truck."
+                            f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no}: session expired, re-logging in..."
                         )
-                except Exception as e:
-                    print(
-                        f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} error: {e}. Continuing to next truck."
-                    )
+                        if not await do_login(truck_page):
+                            print(
+                                f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no}: re-login failed."
+                            )
+                            return False
 
-                # Navigate back to the token page for the next truck
-                if stop_event and stop_event.is_set():
-                    break
-                await page.goto(BASE_URL, wait_until="networkidle")
+                    print(f"\n--- Cycle #{cycle} | Truck: {truck_no} ---")
+                    try:
+                        result = await generate_token_cycle(
+                            truck_page, truck_no, material
+                        )
+                        if not result and result != "already_processed":
+                            print(
+                                f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} failed."
+                            )
+                        return result
+                    except Exception as e:
+                        print(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} error: {e}"
+                        )
+                        return False
+                finally:
+                    await truck_page.close()
 
-                # Re-check if session is still valid; re-login if needed
-                on_token_page = await safe_query_selector(page, 'form[name="frmgo"]')
-                if not on_token_page:
-                    print(
-                        f"[{datetime.now().strftime('%H:%M:%S')}] Session expired, re-logging in..."
-                    )
-                    if not await do_login(page):
-                        print("ERROR: Re-login failed. Stopping.")
-                        break
+            # Process all trucks concurrently
+            await asyncio.gather(
+                *(process_truck(t) for t in trucks),
+                return_exceptions=True,
+            )
 
             cycle += 1
 
