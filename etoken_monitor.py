@@ -555,9 +555,16 @@ async def run_monitor(headless=False, stop_event=None):
 
         # --- Repeated token generation (all trucks per cycle, in parallel) ---
         cycle = 1
+        completed_trucks = set()
+
         while not (stop_event and stop_event.is_set()):
+            pending_trucks = [t for t in trucks if t not in completed_trucks]
+            if not pending_trucks:
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] All trucks completed successfully. Stopping.")
+                break
+
             print(f"\n{'=' * 60}")
-            print(f"TOKEN GENERATION CYCLE #{cycle}")
+            print(f"TOKEN GENERATION CYCLE #{cycle} | Pending: {pending_trucks}")
             print(f"{'=' * 60}")
 
             async def process_truck(truck_no):
@@ -598,11 +605,19 @@ async def run_monitor(headless=False, stop_event=None):
                 finally:
                     await truck_page.close()
 
-            # Process all trucks concurrently
-            await asyncio.gather(
-                *(process_truck(t) for t in trucks),
+            # Process all pending trucks concurrently
+            results = await asyncio.gather(
+                *(process_truck(t) for t in pending_trucks),
                 return_exceptions=True,
             )
+
+            # Mark successfully completed trucks
+            for truck_no, result in zip(pending_trucks, results):
+                if result is True:
+                    completed_trucks.add(truck_no)
+                    print(
+                        f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} completed. ({len(completed_trucks)}/{len(trucks)} done)"
+                    )
 
             cycle += 1
 
