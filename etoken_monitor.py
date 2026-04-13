@@ -64,6 +64,22 @@ DEFAULT_LON = 103.906435
 TOKENS_FILE = get_app_data_dir() / "tokens.json"
 ACTIVITY_FILE = get_app_data_dir() / "activity.json"
 
+RESULT_TOKEN_LABEL = "Last Token Generated:"
+STATUS_SUCCESS = "success"
+STATUS_FAILED = "failed"
+STATUS_SKIPPED = "skipped"
+STATUS_PROCESSING = "processing"
+STATUS_PENDING_CONFIRMATION = "pending_confirmation"
+
+PENDING_TOKEN_MESSAGE = (
+    "Submission appears accepted, but the token is not visible yet. "
+    "Keeping this truck in processing."
+)
+ALREADY_PROCESSED_MESSAGE = (
+    "Platform reports this truck is already processed. "
+    "Keeping the existing submission in processing."
+)
+
 
 async def safe_query_selector(page, selector, retries=3, delay=0.5):
     """Query selector with retry to handle navigation context destruction."""
@@ -75,6 +91,113 @@ async def safe_query_selector(page, selector, retries=3, delay=0.5):
                 await asyncio.sleep(delay)
                 continue
             raise
+
+
+def _read_json_records(path):
+    """Read a JSON list from disk, returning an empty list on failure."""
+    if not path.exists():
+        return []
+    try:
+        records = json.loads(path.read_text())
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return records if isinstance(records, list) else []
+
+
+def _write_json_records(path, records):
+    """Persist a JSON list to disk."""
+    path.write_text(json.dumps(records, indent=2))
+
+
+def is_already_processed_message(message: str) -> bool:
+    """Return True when the server says the truck was already processed."""
+    lowered = (message or "").lower()
+    return "already" in lowered and "process" in lowered
+
+
+def has_processing_signal(result: dict) -> bool:
+    """Return True when the parsed table looks like a real submission result."""
+    for label in ("E-Token Generated @", "Source Site Entry Record:", "Site Code:"):
+        if (result.get(label) or "").strip():
+            return True
+    return False
+
+
+def classify_generation_result(result: dict) -> str:
+    """Classify the parsed result table from the token page."""
+    token_value = (result.get(RESULT_TOKEN_LABEL) or "").strip()
+    if token_value:
+        return STATUS_SUCCESS
+    if has_processing_signal(result):
+        return STATUS_PENDING_CONFIRMATION
+    return STATUS_FAILED
+
+
+def build_token_record(
+    truck_no: str,
+    material: str,
+    result: dict,
+    *,
+    status: str,
+    message: str = "",
+    timestamp: str = None,
+) -> dict:
+    """Build the token record written to tokens.json."""
+    token_value = (result.get(RESULT_TOKEN_LABEL) or "").strip()
+    return {
+        "timestamp": timestamp or datetime.now().isoformat(timespec="seconds"),
+        "truck_no": truck_no,
+        "material": material,
+        "token": token_value,
+        "site": result.get("Site Code:", "CR202"),
+        "generated_at": result.get("E-Token Generated @", ""),
+        "entry_record": result.get("Source Site Entry Record:", ""),
+        "status": status,
+        "message": message or token_value,
+    }
+
+
+def find_processing_token_record(truck_no: str, material: str):
+    """Return the newest processing token record for this truck/material, if any."""
+    for record in reversed(_read_json_records(TOKENS_FILE)):
+        if (
+            record.get("truck_no") == truck_no
+            and record.get("material") == material
+            and record.get("status") == STATUS_PROCESSING
+        ):
+            return record
+    return None
+
+
+def _find_matching_token_index(tokens, token_data):
+    """Find the newest token row we should update instead of appending."""
+    for idx in range(len(tokens) - 1, -1, -1):
+        record = tokens[idx]
+        if record.get("truck_no") != token_data.get("truck_no"):
+            continue
+        if record.get("material") != token_data.get("material"):
+            continue
+
+        incoming_entry = token_data.get("entry_record") or ""
+        existing_entry = record.get("entry_record") or ""
+        if incoming_entry and existing_entry and incoming_entry == existing_entry:
+            return idx
+
+        if record.get("status") == STATUS_PROCESSING or not record.get("token"):
+            return idx
+    return None
+
+
+def _merge_token_records(existing, incoming):
+    """Merge token rows without overwriting good data with empty placeholders."""
+    merged = dict(existing)
+    for key, value in incoming.items():
+        if key in {"timestamp", "status", "message"}:
+            merged[key] = value
+            continue
+        if value not in ("", None):
+            merged[key] = value
+    return merged
 
 
 def validate_env():
@@ -98,30 +221,140 @@ def validate_env():
 
 
 async def save_token(token_data: dict):
-    """Append token data to tokens.json."""
+    """Insert or update a token row in tokens.json."""
     async with _get_tokens_lock():
-        tokens = []
-        if TOKENS_FILE.exists():
-            try:
-                tokens = json.loads(TOKENS_FILE.read_text())
-            except (json.JSONDecodeError, ValueError):
-                tokens = []
-        tokens.append(token_data)
-        TOKENS_FILE.write_text(json.dumps(tokens, indent=2))
+        tokens = _read_json_records(TOKENS_FILE)
+        match_idx = _find_matching_token_index(tokens, token_data)
+        if match_idx is None:
+            tokens.append(token_data)
+        else:
+            tokens[match_idx] = _merge_token_records(tokens[match_idx], token_data)
+        _write_json_records(TOKENS_FILE, tokens)
     print(f"Token saved to {TOKENS_FILE}")
 
 
 async def save_activity(activity_data: dict):
     """Append activity record to activity.json."""
     async with _get_activity_lock():
-        activities = []
-        if ACTIVITY_FILE.exists():
-            try:
-                activities = json.loads(ACTIVITY_FILE.read_text())
-            except (json.JSONDecodeError, ValueError):
-                activities = []
+        activities = _read_json_records(ACTIVITY_FILE)
         activities.append(activity_data)
-        ACTIVITY_FILE.write_text(json.dumps(activities, indent=2))
+        _write_json_records(ACTIVITY_FILE, activities)
+
+
+async def capture_result_table(page, retries=5, delay=1):
+    """Parse the result table, retrying for slow-rendering DOM updates."""
+    result = {}
+    for attempt in range(retries):
+        try:
+            await page.wait_for_selector("table td em", timeout=5000)
+        except Exception:
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+            continue
+
+        result = await page.evaluate(
+            """() => {
+                const cells = document.querySelectorAll('table td em');
+                const data = {};
+                const labels = [];
+                cells.forEach((em, i) => {
+                    const text = em.textContent.trim();
+                    if (i % 2 === 0) {
+                        labels.push(text);
+                    } else {
+                        data[labels[labels.length - 1]] = text;
+                    }
+                });
+                return data;
+            }"""
+        )
+
+        if classify_generation_result(result) == STATUS_SUCCESS:
+            return result
+
+        if attempt < retries - 1:
+            await asyncio.sleep(delay)
+    return result
+
+
+async def record_processing_state(truck_no: str, material: str, result: dict, message: str):
+    """Persist a submission that looks accepted but still lacks a visible token."""
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    token_data = build_token_record(
+        truck_no,
+        material,
+        result,
+        status=STATUS_PROCESSING,
+        message=message,
+        timestamp=timestamp,
+    )
+    await save_token(token_data)
+    await save_activity(
+        {
+            "timestamp": timestamp,
+            "truck_no": truck_no,
+            "material": material,
+            "status": STATUS_PROCESSING,
+            "message": token_data["message"],
+            "token": token_data["token"],
+        }
+    )
+    return token_data
+
+
+async def ensure_token_page(page):
+    """Navigate to the submission page and re-login if the session expired."""
+    on_token_page = await safe_query_selector(page, 'form[name="frmgo"]')
+    if on_token_page:
+        return True
+
+    await page.goto(BASE_URL, wait_until="networkidle")
+    return await do_login(page)
+
+
+async def reconcile_pending_submission(page, truck_no: str, material: str):
+    """Try to recover a token from the current page before re-submitting."""
+    print(
+        f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no}: reconciling pending submission..."
+    )
+    result = await capture_result_table(page, retries=6, delay=1)
+    outcome = classify_generation_result(result)
+
+    if outcome == STATUS_SUCCESS:
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        token_data = build_token_record(
+            truck_no,
+            material,
+            result,
+            status=STATUS_SUCCESS,
+            timestamp=timestamp,
+        )
+        await save_token(token_data)
+        await save_activity(
+            {
+                "timestamp": timestamp,
+                "truck_no": truck_no,
+                "material": material,
+                "status": STATUS_SUCCESS,
+                "message": f"Recovered delayed token {token_data['token']}",
+                "token": token_data["token"],
+            }
+        )
+        return {"status": STATUS_SUCCESS, "token_data": token_data}
+
+    if outcome == STATUS_PENDING_CONFIRMATION:
+        token_data = await record_processing_state(
+            truck_no,
+            material,
+            result,
+            PENDING_TOKEN_MESSAGE,
+        )
+        return {"status": STATUS_PROCESSING, "token_data": token_data}
+
+    return {
+        "status": STATUS_FAILED,
+        "message": "Previous submission page no longer exposes recoverable token data.",
+    }
 
 
 async def wait_and_check_login(page, timeout_sec=3):
@@ -247,14 +480,16 @@ async def do_login(page):
     return True
 
 
-async def generate_token_cycle(page, truck_no, material):
+async def generate_token_cycle(page, truck_no, material, pending_recovery=False):
     """Perform one truck-entry + token-generation cycle for a single truck.
 
     Args:
         page: Playwright page object.
         truck_no: The truck number to use for this cycle.
+        pending_recovery: True when a previous submission likely succeeded but
+            the token was never captured.
 
-    Returns True on success, False on failure, "already_processed" if truck was already done.
+    Returns a result dict with a status key.
     """
     # --- Truck entry validation ---
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Filling truck entry form...")
@@ -328,30 +563,43 @@ async def generate_token_cycle(page, truck_no, material):
         error_text = (await error_title.inner_text()).strip()
         if error_text:
             print(f"ERROR: Truck entry validation failed: {error_text}")
-            if "already" in error_text.lower() and "process" in error_text.lower():
+            if is_already_processed_message(error_text):
                 print(
                     f"[{datetime.now().strftime('%H:%M:%S')}] Truck already processed, skipping to next."
                 )
+                if pending_recovery or find_processing_token_record(truck_no, material):
+                    token_data = await record_processing_state(
+                        truck_no,
+                        material,
+                        {},
+                        ALREADY_PROCESSED_MESSAGE,
+                    )
+                    return {
+                        "status": STATUS_PROCESSING,
+                        "token_data": token_data,
+                        "message": error_text,
+                    }
+
                 await save_activity(
                     {
                         "timestamp": datetime.now().isoformat(timespec="seconds"),
                         "truck_no": truck_no,
                         "material": material,
-                        "status": "skipped",
+                        "status": STATUS_SKIPPED,
                         "message": error_text,
                     }
                 )
-                return "already_processed"
+                return {"status": STATUS_SKIPPED, "message": error_text}
             await save_activity(
                 {
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                     "truck_no": truck_no,
                     "material": material,
-                    "status": "failed",
+                    "status": STATUS_FAILED,
                     "message": error_text,
                 }
             )
-            return False
+            return {"status": STATUS_FAILED, "message": error_text}
 
     # --- Token generation ---
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Generating token...")
@@ -407,27 +655,10 @@ async def generate_token_cycle(page, truck_no, material):
     )
 
     await page.wait_for_load_state("networkidle")
-    await asyncio.sleep(3)
 
-    # --- Capture the result ---
+    # --- Capture the result (retry to handle slow-rendering pages) ---
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Capturing result...")
-
-    result = await page.evaluate(
-        """() => {
-            const cells = document.querySelectorAll('table td em');
-            const data = {};
-            const labels = [];
-            cells.forEach((em, i) => {
-                const text = em.textContent.trim();
-                if (i % 2 === 0) {
-                    labels.push(text);
-                } else {
-                    data[labels[labels.length - 1]] = text;
-                }
-            });
-            return data;
-        }"""
-    )
+    result = await capture_result_table(page, retries=8, delay=1)
 
     print(f"\n{'=' * 60}")
     print("TOKEN GENERATION RESULT:")
@@ -437,30 +668,46 @@ async def generate_token_cycle(page, truck_no, material):
     print(f"{'=' * 60}\n")
 
     timestamp = datetime.now().isoformat(timespec="seconds")
-    token_value = result.get("Last Token Generated:", "")
-    token_data = {
-        "timestamp": timestamp,
-        "truck_no": truck_no,
-        "material": material,
-        "token": token_value,
-        "site": result.get("Site Code:", "CR202"),
-        "generated_at": result.get("E-Token Generated @", ""),
-        "entry_record": result.get("Source Site Entry Record:", ""),
-    }
+    outcome = classify_generation_result(result)
+    token_data = build_token_record(
+        truck_no,
+        material,
+        result,
+        status=STATUS_SUCCESS if outcome == STATUS_SUCCESS else STATUS_PROCESSING,
+        timestamp=timestamp,
+    )
 
-    if not token_value:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: Token generation returned empty token.")
+    if outcome == STATUS_PENDING_CONFIRMATION:
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] Token not visible yet; storing processing state."
+        )
+        token_data = await record_processing_state(
+            truck_no,
+            material,
+            result,
+            PENDING_TOKEN_MESSAGE,
+        )
+        return {
+            "status": STATUS_PENDING_CONFIRMATION,
+            "token_data": token_data,
+            "message": token_data["message"],
+        }
+
+    if outcome == STATUS_FAILED:
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: Token generation returned no usable result."
+        )
         await save_activity(
             {
                 "timestamp": timestamp,
                 "truck_no": truck_no,
                 "material": material,
-                "status": "failed",
-                "message": "Empty token returned",
+                "status": STATUS_FAILED,
+                "message": "No token or recoverable result returned",
                 "token": "",
             }
         )
-        return False
+        return {"status": STATUS_FAILED, "message": "No token or recoverable result"}
 
     await save_token(token_data)
     await save_activity(
@@ -468,12 +715,12 @@ async def generate_token_cycle(page, truck_no, material):
             "timestamp": timestamp,
             "truck_no": truck_no,
             "material": material,
-            "status": "success",
+            "status": STATUS_SUCCESS,
             "message": token_data["token"],
             "token": token_data["token"],
         }
     )
-    return True
+    return {"status": STATUS_SUCCESS, "token_data": token_data}
 
 
 async def run_monitor(headless=False, stop_event=None):
@@ -539,61 +786,92 @@ async def run_monitor(headless=False, stop_event=None):
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(
-            geolocation={"latitude": DEFAULT_LAT, "longitude": DEFAULT_LON},
-            permissions=["geolocation"],
-        )
-        page = await context.new_page()
 
-        # --- Login (once) ---
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Navigating to {BASE_URL}")
-        await page.goto(BASE_URL, wait_until="networkidle")
-
-        if not await do_login(page):
-            await browser.close()
-            return
-
-        # --- Repeated token generation (all trucks per cycle, in parallel) ---
+        # --- Repeated token generation (one long-lived session per truck) ---
         cycle = 1
         completed_trucks = set()
+        truck_sessions = {}
+
+        async def build_truck_session(truck_no):
+            """Create and log into a persistent session for one truck."""
+            truck_ctx = await browser.new_context(
+                geolocation={"latitude": DEFAULT_LAT, "longitude": DEFAULT_LON},
+                permissions=["geolocation"],
+            )
+            truck_page = await truck_ctx.new_page()
+            try:
+                if not await ensure_token_page(truck_page):
+                    print(
+                        f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no}: login failed."
+                    )
+                    await truck_page.close()
+                    await truck_ctx.close()
+                    return None
+            except Exception:
+                await truck_page.close()
+                await truck_ctx.close()
+                raise
+
+            return {
+                "context": truck_ctx,
+                "page": truck_page,
+                "awaiting_confirmation": bool(
+                    find_processing_token_record(truck_no, material)
+                ),
+            }
 
         async def process_truck(truck_no, cycle_num):
-            """Process a single truck on its own page."""
-            truck_page = await context.new_page()
-            try:
-                await truck_page.goto(BASE_URL, wait_until="networkidle")
+            """Process a single truck in its own long-lived session."""
+            session = truck_sessions.get(truck_no)
+            if session is None:
+                session = await build_truck_session(truck_no)
+                if session is None:
+                    return {"status": STATUS_FAILED, "message": "login failed"}
+                truck_sessions[truck_no] = session
 
-                # Re-login if session expired
-                on_token_page = await safe_query_selector(
-                    truck_page, 'form[name="frmgo"]'
+            truck_page = session["page"]
+            if session["awaiting_confirmation"]:
+                recovered = await reconcile_pending_submission(
+                    truck_page,
+                    truck_no,
+                    material,
                 )
-                if not on_token_page:
-                    print(
-                        f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no}: session expired, re-logging in..."
-                    )
-                    if not await do_login(truck_page):
-                        print(
-                            f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no}: re-login failed."
-                        )
-                        return False
+                if recovered["status"] in (STATUS_SUCCESS, STATUS_PROCESSING):
+                    session["awaiting_confirmation"] = False
+                    return recovered
+                session["awaiting_confirmation"] = False
 
-                print(f"\n--- Cycle #{cycle_num} | Truck: {truck_no} ---")
-                try:
-                    result = await generate_token_cycle(
-                        truck_page, truck_no, material
-                    )
-                    if not result and result != "already_processed":
-                        print(
-                            f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} failed."
-                        )
-                    return result
-                except Exception as e:
+            if not await ensure_token_page(truck_page):
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no}: login failed."
+                )
+                return {"status": STATUS_FAILED, "message": "login failed"}
+
+            print(f"\n--- Cycle #{cycle_num} | Truck: {truck_no} ---")
+            try:
+                result = await generate_token_cycle(
+                    truck_page,
+                    truck_no,
+                    material,
+                    pending_recovery=bool(
+                        find_processing_token_record(truck_no, material)
+                    ),
+                )
+                if result["status"] == STATUS_PENDING_CONFIRMATION:
+                    session["awaiting_confirmation"] = True
+                else:
+                    session["awaiting_confirmation"] = False
+
+                if result["status"] == STATUS_FAILED:
                     print(
-                        f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} error: {e}"
+                        f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} failed."
                     )
-                    return False
-            finally:
-                await truck_page.close()
+                return result
+            except Exception as e:
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} error: {e}"
+                )
+                return {"status": STATUS_FAILED, "message": str(e)}
 
         while not (stop_event and stop_event.is_set()):
             pending_trucks = [t for t in trucks if t not in completed_trucks]
@@ -605,15 +883,23 @@ async def run_monitor(headless=False, stop_event=None):
             print(f"TOKEN GENERATION CYCLE #{cycle} | Pending: {pending_trucks}")
             print(f"{'=' * 60}")
 
-            # Process all pending trucks concurrently
+            # Process all pending trucks concurrently (each keeps its own session)
             results = await asyncio.gather(
                 *(process_truck(t, cycle) for t in pending_trucks),
                 return_exceptions=True,
             )
 
-            # Mark successfully completed trucks
+            # Mark trucks that either succeeded or are now safely in processing
             for truck_no, result in zip(pending_trucks, results):
-                if result is True:
+                if isinstance(result, Exception):
+                    print(
+                        f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} exception: {result}"
+                    )
+                elif result["status"] in (
+                    STATUS_SUCCESS,
+                    STATUS_PROCESSING,
+                    STATUS_SKIPPED,
+                ):
                     completed_trucks.add(truck_no)
                     print(
                         f"[{datetime.now().strftime('%H:%M:%S')}] Truck {truck_no} completed. ({len(completed_trucks)}/{len(trucks)} done)"
@@ -651,6 +937,16 @@ async def run_monitor(headless=False, stop_event=None):
                     await asyncio.sleep(0.1)
             else:
                 await asyncio.sleep(cycle_interval)
+
+        for session in truck_sessions.values():
+            try:
+                await session["page"].close()
+            except Exception:
+                pass
+            try:
+                await session["context"].close()
+            except Exception:
+                pass
 
         await browser.close()
 
