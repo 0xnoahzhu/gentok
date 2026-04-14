@@ -17,6 +17,7 @@
     .status-stopped { background: #e2e3e5; color: #383d41; }
     .badge-success { background: #d4edda; color: #155724; }
     .badge-failed { background: #f8d7da; color: #721c24; }
+    .badge-processing { background: #fff3cd; color: #856404; }
     .badge-skipped { background: #e2e3e5; color: #383d41; }
     .right-col { display: flex; flex-direction: column; overflow: hidden; }
     .right-col > .card { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -147,13 +148,14 @@
                   <th>Timestamp</th>
                   <th>Truck</th>
                   <th>Material</th>
+                  <th>Status</th>
                   <th>Token ID</th>
                   <th>Site</th>
                   <th>Generated At</th>
                 </tr>
               </thead>
               <tbody id="tokenBody">
-                <tr><td colspan="6" class="text-center text-muted py-3">Loading...</td></tr>
+                <tr><td colspan="7" class="text-center text-muted py-3">Loading...</td></tr>
               </tbody>
             </table>
           </div>
@@ -254,21 +256,30 @@ async function refreshTokens() {
     const data = await res.json();
     const tbody = document.getElementById("tokenBody");
     if (!data.length) {
-      tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">No tokens yet.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">No tokens yet.</td></tr>';
       return;
     }
     const items = data.slice(0, 2000);
-    tbody.innerHTML = items.map(t => "<tr>" +
-      "<td>" + esc(t.timestamp) + "</td>" +
-      "<td>" + esc(t.truck_no) + "</td>" +
-      "<td>" + esc(t.material) + "</td>" +
-      '<td class="fw-semibold">' + esc(t.token) + "</td>" +
-      "<td>" + esc(t.site) + "</td>" +
-      "<td>" + esc(t.generated_at) + "</td>" +
-      "</tr>").join("");
+    tbody.innerHTML = items.map(t => {
+      const status = t.status || (t.token ? "success" : "processing");
+      const statusClass = status === "success" ? "badge-success"
+                        : status === "processing" ? "badge-processing"
+                        : status === "failed" ? "badge-failed"
+                        : "badge-skipped";
+      const tokenText = t.token || t.message || "Processing";
+      return "<tr>" +
+        "<td>" + esc(t.timestamp) + "</td>" +
+        "<td>" + esc(t.truck_no) + "</td>" +
+        "<td>" + esc(t.material) + "</td>" +
+        '<td><span class="status-badge ' + statusClass + '">' + esc(status) + '</span></td>' +
+        '<td class="fw-semibold">' + esc(tokenText) + "</td>" +
+        "<td>" + esc(t.site) + "</td>" +
+        "<td>" + esc(t.generated_at) + "</td>" +
+        "</tr>";
+    }).join("");
   } catch {
     document.getElementById("tokenBody").innerHTML =
-      '<tr><td colspan="6" class="text-center text-danger py-3">Error loading tokens.</td></tr>';
+      '<tr><td colspan="7" class="text-center text-danger py-3">Error loading tokens.</td></tr>';
   }
 }
 
@@ -291,9 +302,10 @@ async function refreshActivity() {
     const items = data.slice(0, 2000);
     tbody.innerHTML = items.map(a => {
       const statusClass = a.status === "success" ? "badge-success"
+                        : a.status === "processing" ? "badge-processing"
                         : a.status === "failed"  ? "badge-failed"
                         : "badge-skipped";
-      const details = a.status === "success" ? esc(a.token || a.message) : esc(a.message);
+      const details = a.status === "success" ? esc(a.token || a.message) : esc(a.message || a.token);
       return "<tr>" +
         "<td>" + esc(a.timestamp) + "</td>" +
         "<td>" + esc(a.truck_no) + "</td>" +
